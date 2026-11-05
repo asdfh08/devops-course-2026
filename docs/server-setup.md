@@ -169,3 +169,89 @@ hostname -f        # devops-vm.devops.local
 | `03-ssh-hardened` | 22.10.2026, ≈18:15 | SSH на порту 2222 с ужесточёнными параметрами, добавлено правило проброса 127.0.0.1:2223 → 2222 |
 
 Проверка итоговой конфигурации: `scripts/audit.sh` (код возврата 0 при соответствии всем требованиям).
+
+## 9. Контейнеризация
+
+### Docker Engine
+
+- Установлен из официального репозитория Docker (`download.docker.com`, канал `stable`, для Ubuntu 26.04 `resolute`, arm64); пакет `docker.io` из репозитория дистрибутива не используется.
+- Версии: Docker Engine 29.9.3, плагин Compose v5.7.0.
+- Участники группы `docker`: только `devops` (у пользователя есть `sudo`; членство в группе `docker` равносильно правам root).
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops      # затем переподключиться по SSH
+```
+
+### Проект
+
+- Каталог на сервере: `/home/devops/app` (в репозитории — `app/`), доставляется с хоста командой
+  `rsync -avz --delete --exclude=.env app/ devops:app/` (исключение `.env` обязательно, иначе `--delete` удалит его).
+- Файлы: `Dockerfile`, `.dockerignore`, `app.py`, `requirements.txt`, `docker-compose.yml`, `.env.example`.
+- Образ приложения: `devops-app:1.0` (на основе `python:3.12-slim`, процесс работает от системного пользователя `app`, не root).
+- СУБД: `postgres:16-alpine` (основная версия зафиксирована, так как формат данных несовместим между основными версиями).
+
+### Файл .env
+
+- Расположение: `/home/devops/app/.env`, владелец `devops`, права `600`.
+- В репозиторий не добавляется (`.env` указан в `.gitignore` и `app/.dockerignore`), на хост не копируется.
+- Создание из шаблона со случайным паролем:
+
+```bash
+cd ~/app
+cp .env.example .env
+chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+```
+
+### Порты, сеть, тома
+
+| Сервис | Порт в контейнере | Публикация на сервере |
+|---|---|---|
+| `app` | 5000 | `127.0.0.1:5000` — только для Nginx на этой же машине |
+| `db` | 5432 | не публикуется, доступен только в сети проекта |
+
+- Сеть проекта: `app_backend` (bridge); приложение обращается к СУБД по имени `db` (`DB_HOST=db`).
+- Именованный том: `app_db_data` → `/var/lib/postgresql/data` в контейнере `db`.
+- `docker compose down` сохраняет том, `docker compose down -v` удаляет его вместе с данными.
+- Порт, опубликованный на `0.0.0.0`, доступен из сети в обход правил UFW (Docker добавляет собственные правила iptables), поэтому порт приложения публикуется только на `127.0.0.1`.
+
+Запуск и проверка:
+
+```bash
+cd ~/app
+docker compose up -d --build
+docker compose ps                         # db — (healthy)
+curl -s http://127.0.0.1:5000/            # Hello from Docker, Конкина! Visits: N
+sudo ss -tlnp | grep -E ':(5000|5432)\b'  # только 127.0.0.1:5000
+```
+
+Контейнеры имеют `restart: unless-stopped` и запускаются автоматически после перезагрузки сервера.
+
+### Обратный прокси-сервер
+
+В блок HTTPS файла `/etc/nginx/sites-available/devops-site` (перед `location /`) добавлено:
+
+```nginx
+location /app/ {
+    proxy_pass http://127.0.0.1:5000/;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl --cacert ~/devops.crt https://devops.local/app/          # на хосте
+```
+
+Статический ресурс по адресу `https://devops.local/` сохранён. При остановленном контейнере приложения Nginx возвращает `502 Bad Gateway` с записью `connect() failed (111: Connection refused) while connecting to upstream` в `/var/log/nginx/devops-site.error.log`.
